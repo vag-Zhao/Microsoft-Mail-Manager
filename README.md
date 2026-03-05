@@ -148,6 +148,22 @@ wails build
 
 ---
 
+## 界面截图
+
+### 1) 邮件查看
+
+![邮件查看界面](screenshots/mail-view.png)
+
+### 2) 账号管理
+
+![账号管理界面](screenshots/manage-view.png)
+
+### 3) 深色模式
+
+![深色模式界面](screenshots/dark-mode.png)
+
+---
+
 ## 版本记录
 
 请查看 [`CHANGELOG.md`](CHANGELOG.md) 获取详细变更历史。
