@@ -4,32 +4,22 @@
 
 ## 核心能力
 
-### 1) 多账号与分组管理
-- 批量导入账号（支持 `.zgsacc` 归档文件与 `.txt` 文本文件）
-- 分组创建、删除、清空、账号移动
-- 批量删除、批量移动（事务保护）
-- 账号 Token 有效性检测
-
-### 2) 邮件读取与查看
-- 文件夹列表、分页邮件列表、邮件详情
-- HTML 邮件安全渲染（脚本与危险协议清理）
-- 附件列表读取与下载
-
-### 3) 双协议访问策略
-- 优先使用 Outlook REST API（O2）
-- 失败时自动回退 IMAP，并记录账号协议类型
-- 后续请求按协议类型直连，减少重复探测
-
-### 4) 导入导出链路优化
-- 导出使用自定义归档格式（`.zgsacc`），避免明文可直接读取
-- 兼容外部明文 `.txt` 导入
-- 导入结果结构化返回：`total / success / failed / errors`
-
-### 5) 本地安全与稳定性
-- 敏感字段（Password / RefreshToken / AccessToken）本地加密存储
-- Token 缓存 + 过期清理机制
-- IMAP 连接池、健康检查与优雅关闭
-- SQLite 连接池配置与自动迁移
+<table>
+  <tr>
+    <td valign="top" width="50%">
+      <strong>多账号管理</strong><br />
+      导入/导出、分组管理、批量移动与删除。<br /><br />
+      <strong>邮件查看</strong><br />
+      文件夹浏览、分页列表、详情与附件下载。
+    </td>
+    <td valign="top" width="50%">
+      <strong>协议自动切换</strong><br />
+      优先 REST API，失败自动回退 IMAP 并持久化策略。<br /><br />
+      <strong>本地安全存储</strong><br />
+      敏感字段加密、Token 管理、连接池与迁移保障。
+    </td>
+  </tr>
+</table>
 
 ---
 
