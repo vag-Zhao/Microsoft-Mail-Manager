@@ -30,15 +30,28 @@ var (
 	toRe        = regexp.MustCompile(`(?m)^To:\s*(.+)`)
 	subjRe      = regexp.MustCompile(`(?m)^Subject:\s*(.+)`)
 	dateRe      = regexp.MustCompile(`(?m)^Date:\s*(.+)`)
-	seenRe      = regexp.MustCompile(`FLAGS \([^)]*\\Seen[^)]*\)`)
-	boundaryRe  = regexp.MustCompile(`boundary="?([^"\s\r\n]+)"?`)
-	htmlTagRe   = regexp.MustCompile(`<[^>]*>`)
+	seenRe              = regexp.MustCompile(`FLAGS \([^)]*\\Seen[^)]*\)`)
+	boundaryRe          = regexp.MustCompile(`boundary="?([^"\s\r\n]+)"?`)
+	htmlTagRe           = regexp.MustCompile(`<[^>]*>`)
+	scriptTagRe         = regexp.MustCompile(`(?is)<script[\s\S]*?</script>`)
+	scriptOpenTagRe     = regexp.MustCompile(`(?i)<script[^>]*>`)
+	noscriptTagRe       = regexp.MustCompile(`(?is)<noscript[\s\S]*?</noscript>`)
+	onQuotedEventAttrRe = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*["'][^"']*["']`)
+	onEventAttrRe       = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*[^\s>]+`)
+	javascriptURLRe     = regexp.MustCompile(`(?i)javascript:`)
+	vbscriptURLRe       = regexp.MustCompile(`(?i)vbscript:`)
+	dataHTMLURLRe       = regexp.MustCompile(`(?i)data:\s*text/html`)
 )
 
 // IMAPService IMAP邮件服务
+//
+// 提供 IMAP 协议的邮件访问功能
+// 包含连接池管理和自动清理机制
 type IMAPService struct {
-	pool   map[string]*pooledClient // 连接池: email -> client
-	poolMu sync.RWMutex
+	pool      map[string]*pooledClient // 连接池: email -> client
+	poolMu    sync.RWMutex             // 连接池读写锁
+	cleanupCh chan struct{}            // 清理协程关闭信号
+	wg        sync.WaitGroup           // 等待协程结束
 }
 
 // pooledClient 池化的IMAP客户端
@@ -122,54 +135,162 @@ func getRestAPIFolderID(imapName string) string {
 }
 
 // NewIMAPService 创建IMAPService实例
+//
+// 初始化连接池并启动后台清理协程
+// 清理协程会定期清理过期连接，防止资源泄漏
+//
+// 返回值：
+//   - *IMAPService: 服务实例
 func NewIMAPService() *IMAPService {
-	return &IMAPService{
-		pool: make(map[string]*pooledClient),
+	svc := &IMAPService{
+		pool:      make(map[string]*pooledClient),
+		cleanupCh: make(chan struct{}),
+	}
+
+	// 启动后台清理协程
+	svc.wg.Add(1)
+	go svc.cleanupLoop()
+
+	return svc
+}
+
+// cleanupLoop 后台清理协程
+//
+// 定期清理过期的 IMAP 连接
+// 清理策略：
+//   - 5分钟未使用的连接
+//   - 创建超过30分钟的连接
+//
+// 清理频率：每分钟检查一次
+func (s *IMAPService) cleanupLoop() {
+	defer s.wg.Done()
+
+	ticker := time.NewTicker(1 * time.Minute)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			s.cleanupExpired()
+		case <-s.cleanupCh:
+			// 收到关闭信号，清理所有连接并退出
+			s.closeAll()
+			return
+		}
 	}
 }
 
-// getClient 从连接池获取或创建新连接
-func (s *IMAPService) getClient(email, accessToken string) (*IMAPClient, error) {
+// cleanupExpired 清理过期连接
+//
+// 遍历连接池，关闭并删除过期连接
+// 过期条件：
+//   - 5分钟未使用（lastUsed）
+//   - 创建超过30分钟（createdAt）
+func (s *IMAPService) cleanupExpired() {
 	s.poolMu.Lock()
 	defer s.poolMu.Unlock()
 
-	// 检查是否有可用的缓存连接
-	if pc, ok := s.pool[email]; ok {
-		age := time.Since(pc.lastUsed)
-		tokenMatch := pc.token == accessToken
-		log.Printf("[IMAP Pool] 找到缓存连接 - email: %s, age: %v, tokenMatch: %v", email, age, tokenMatch)
-		// 连接有效期5分钟，token必须相同
-		if age < 5*time.Minute && tokenMatch {
-			pc.lastUsed = time.Now()
-			log.Printf("[IMAP Pool] 复用缓存连接 - email: %s", email)
-			return pc.client, nil
+	now := time.Now()
+	for email, pc := range s.pool {
+		idle := now.Sub(pc.lastUsed)
+		age := now.Sub(pc.createdAt)
+
+		// 连接超过5分钟未使用，或创建超过30分钟
+		if idle > 5*time.Minute || age > 30*time.Minute {
+			log.Printf("[IMAP Pool] 清理过期连接 - email: %s, idle: %v, age: %v",
+				email, idle, age)
+			pc.client.Close()
+			delete(s.pool, email)
 		}
-		// 连接过期或token变化，关闭旧连接
-		log.Printf("[IMAP Pool] 连接过期或token变化，关闭旧连接 - email: %s, age: %v, tokenMatch: %v", email, age, tokenMatch)
-		pc.client.Close()
-		delete(s.pool, email)
-	} else {
-		log.Printf("[IMAP Pool] 无缓存连接 - email: %s", email)
 	}
 
-	// 创建新连接
-	log.Printf("[IMAP Pool] 创建新连接 - email: %s", email)
+	if len(s.pool) > 0 {
+		log.Printf("[IMAP Pool] 清理完成，当前池大小: %d", len(s.pool))
+	}
+}
+
+// closeAll 关闭所有连接
+//
+// 在应用关闭时调用，清理所有 IMAP 连接
+func (s *IMAPService) closeAll() {
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+
+	log.Printf("[IMAP Pool] 关闭所有连接，当前池大小: %d", len(s.pool))
+	for email, pc := range s.pool {
+		log.Printf("[IMAP Pool] 关闭连接 - email: %s", email)
+		pc.client.Close()
+	}
+	s.pool = make(map[string]*pooledClient)
+}
+
+// Shutdown 优雅关闭服务
+//
+// 停止后台清理协程并关闭所有连接
+// 在应用退出时调用
+func (s *IMAPService) Shutdown() {
+	log.Printf("[IMAP Pool] 开始关闭服务...")
+	close(s.cleanupCh) // 发送关闭信号
+	s.wg.Wait()        // 等待清理协程结束
+	log.Printf("[IMAP Pool] 服务已关闭")
+}
+
+// getClient 从连接池获取或创建新连接
+//
+// 连接复用策略：
+//   - 检查连接是否存在且未过期（5分钟内）
+//   - Token 必须匹配
+//   - 执行健康检查（NOOP 命令）
+//
+// 参数：
+//   - email: 邮箱地址
+//   - accessToken: 访问令牌
+//
+// 返回值：
+//   - *IMAPClient: IMAP 客户端
+//   - error: 连接创建失败
+func (s *IMAPService) getClient(email, accessToken string) (*IMAPClient, error) {
+	now := time.Now()
+
+	s.poolMu.RLock()
+	pc, ok := s.pool[email]
+	s.poolMu.RUnlock()
+
+	if ok {
+		age := now.Sub(pc.lastUsed)
+		if age < 5*time.Minute && pc.token == accessToken {
+			if err := pc.client.healthCheck(); err == nil {
+				s.poolMu.Lock()
+				if cached, exists := s.pool[email]; exists && cached == pc {
+					cached.lastUsed = now
+				}
+				s.poolMu.Unlock()
+				return pc.client, nil
+			}
+		}
+
+		s.poolMu.Lock()
+		if cached, exists := s.pool[email]; exists && cached == pc {
+			cached.client.Close()
+			delete(s.pool, email)
+		}
+		s.poolMu.Unlock()
+	}
+
 	client, err := newIMAPClient(email, accessToken)
 	if err != nil {
-		log.Printf("[IMAP Pool] 创建连接失败 - email: %s, error: %v", email, err)
 		return nil, err
 	}
-	log.Printf("[IMAP Pool] 创建连接成功 - email: %s", email)
 
-	// 缓存连接
+	s.poolMu.Lock()
 	s.pool[email] = &pooledClient{
 		client:    client,
 		email:     email,
 		token:     accessToken,
-		lastUsed:  time.Now(),
-		createdAt: time.Now(),
+		lastUsed:  now,
+		createdAt: now,
 	}
-	log.Printf("[IMAP Pool] 连接已缓存 - email: %s, 池大小: %d", email, len(s.pool))
+	s.poolMu.Unlock()
 
 	return client, nil
 }
@@ -179,6 +300,7 @@ type IMAPClient struct {
 	conn   net.Conn
 	buffer []byte
 	tagNum int
+	mu     sync.Mutex
 }
 
 // getIMAPServer 根据邮箱域名选择IMAP服务器
@@ -245,6 +367,18 @@ func newIMAPClient(email, accessToken string) (*IMAPClient, error) {
 	return client, nil
 }
 
+// healthCheck 健康检查
+//
+// 发送 NOOP 命令验证连接是否仍然有效
+// NOOP 命令不执行任何操作，仅用于保持连接活跃
+//
+// 返回值：
+//   - error: 连接失败或命令执行失败
+func (c *IMAPClient) healthCheck() error {
+	_, err := c.command("NOOP")
+	return err
+}
+
 // command 发送IMAP命令并等待响应
 //
 // IMAP协议要求每个命令都带有唯一的标签（tag），服务器响应时会包含相同的标签。
@@ -264,6 +398,9 @@ func newIMAPClient(email, accessToken string) (*IMAPClient, error) {
 //	        * 1 RECENT\r\n
 //	        A001 OK SELECT completed\r\n
 func (c *IMAPClient) command(cmd string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	c.tagNum++
 	tag := fmt.Sprintf("A%03d", c.tagNum)
 	_, err := c.conn.Write([]byte(tag + " " + cmd + "\r\n"))
@@ -341,24 +478,16 @@ func (c *IMAPClient) Close() {
 
 // GetMailFolders 获取邮件文件夹列表
 func (s *IMAPService) GetMailFolders(email, accessToken string) ([]models.MailFolder, error) {
-	log.Printf("[IMAP] GetMailFolders 开始 - email: %s", email)
-
 	client, err := s.getClient(email, accessToken)
 	if err != nil {
-		log.Printf("[IMAP] getClient 失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] getClient 成功，连接已建立")
 	// 不关闭连接，保持在连接池中
 
-	log.Printf("[IMAP] 发送 LIST 命令...")
 	resp, err := client.command("LIST \"\" \"*\"")
 	if err != nil {
-		log.Printf("[IMAP] LIST 命令失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] LIST 响应长度: %d 字节", len(resp))
-	log.Printf("[IMAP] LIST 响应内容:\n%s", resp)
 
 	var folders []models.MailFolder
 	// 存储原始IMAP名称用于STATUS查询
@@ -409,10 +538,8 @@ func (s *IMAPService) GetMailFolders(email, accessToken string) ([]models.MailFo
 		log.Printf("[IMAP] 发送命令: %s", statusCmd)
 		statusResp, err := client.command(statusCmd)
 		if err != nil {
-			log.Printf("[IMAP] STATUS 命令失败: %v", err)
 			continue
 		}
-		log.Printf("[IMAP] STATUS 响应:\n%s", statusResp)
 
 		// 解析: * STATUS "INBOX" (MESSAGES 10 UNSEEN 2)
 		if m := msgRe.FindStringSubmatch(statusResp); len(m) > 1 {
@@ -436,112 +563,75 @@ func (s *IMAPService) GetMailFolders(email, accessToken string) ([]models.MailFo
 
 // GetMessages 获取邮件列表
 func (s *IMAPService) GetMessages(email, accessToken, folderID string, skip, top int) ([]models.Message, error) {
-	log.Printf("[IMAP] GetMessages 开始 - email: %s, folderID: %s, skip: %d, top: %d", email, folderID, skip, top)
-
 	client, err := s.getClient(email, accessToken)
 	if err != nil {
-		log.Printf("[IMAP] getClient 失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] getClient 成功")
 	// 不关闭连接，保持在连接池中
 
 	// 映射文件夹名称
 	imapFolder := MapFolderID(folderID)
-	log.Printf("[IMAP] 文件夹映射: %s -> %s", folderID, imapFolder)
 
 	// 选择文件夹
 	selectCmd := fmt.Sprintf("SELECT \"%s\"", imapFolder)
-	log.Printf("[IMAP] 发送命令: %s", selectCmd)
 	selectResp, err := client.command(selectCmd)
 	if err != nil {
-		log.Printf("[IMAP] SELECT 命令失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] SELECT 响应:\n%s", selectResp)
 
 	// 解析邮件总数
 	matches := existsRe.FindStringSubmatch(selectResp)
-	log.Printf("[IMAP] EXISTS 正则匹配结果: %v", matches)
 	if len(matches) < 2 {
-		log.Printf("[IMAP] 未找到 EXISTS，返回空列表")
 		return []models.Message{}, nil
 	}
 	total, _ := strconv.Atoi(matches[1])
-	log.Printf("[IMAP] 邮件总数: %d", total)
 	if total == 0 {
-		log.Printf("[IMAP] 邮件总数为0，返回空列表")
 		return []models.Message{}, nil
 	}
 
 	// 计算获取范围（从最新的开始）
 	start := total - skip - top + 1
 	end := total - skip
-	log.Printf("[IMAP] 计算范围: total=%d, skip=%d, top=%d -> start=%d, end=%d", total, skip, top, start, end)
 	if start < 1 {
 		start = 1
-		log.Printf("[IMAP] start 调整为 1")
 	}
 	if end < 1 {
-		log.Printf("[IMAP] end < 1，返回空列表")
 		return []models.Message{}, nil
 	}
 
 	// 获取邮件头
 	fetchCmd := fmt.Sprintf("FETCH %d:%d (UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])", start, end)
-	log.Printf("[IMAP] 发送命令: %s", fetchCmd)
 	fetchResp, err := client.command(fetchCmd)
 	if err != nil {
-		log.Printf("[IMAP] FETCH 命令失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] FETCH 响应长度: %d 字节", len(fetchResp))
-	log.Printf("[IMAP] FETCH 响应内容:\n%s", fetchResp)
 
-	messages := parseMessages(fetchResp)
-	log.Printf("[IMAP] 解析到 %d 封邮件", len(messages))
-	for i, msg := range messages {
-		log.Printf("[IMAP] 邮件[%d]: ID=%s, Subject=%s, From=%v", i, msg.ID, msg.Subject, msg.From)
-	}
-
-	return messages, nil
+	return parseMessages(fetchResp), nil
 }
 
 // GetMessage 获取邮件详情
 func (s *IMAPService) GetMessage(email, accessToken, folderID, messageID string) (*models.Message, error) {
-	log.Printf("[IMAP] GetMessage 开始 - email: %s, folderID: %s, messageID: %s", email, folderID, messageID)
-
 	client, err := s.getClient(email, accessToken)
 	if err != nil {
-		log.Printf("[IMAP] getClient 失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] getClient 成功")
 	// 不关闭连接，保持在连接池中
 
 	// 映射文件夹名称
 	imapFolder := MapFolderID(folderID)
-	log.Printf("[IMAP] 文件夹映射: %s -> %s", folderID, imapFolder)
 
 	selectCmd := fmt.Sprintf("SELECT \"%s\"", imapFolder)
-	log.Printf("[IMAP] 发送命令: %s", selectCmd)
-	selectResp, _ := client.command(selectCmd)
-	log.Printf("[IMAP] SELECT 响应: %s", selectResp)
+	_, _ = client.command(selectCmd)
 
 	// 使用UID获取完整邮件
 	fetchCmd := fmt.Sprintf("UID FETCH %s (FLAGS BODY[])", messageID)
-	log.Printf("[IMAP] 发送命令: %s", fetchCmd)
 	fetchResp, err := client.command(fetchCmd)
 	if err != nil {
-		log.Printf("[IMAP] UID FETCH 失败: %v", err)
 		return nil, err
 	}
-	log.Printf("[IMAP] UID FETCH 响应长度: %d 字节", len(fetchResp))
 
 	msg := parseFullMessage(fetchResp)
 	msg.ID = messageID // 设置邮件ID，用于前端匹配选中状态
-	log.Printf("[IMAP] 解析邮件: ID=%s, Subject=%s, From=%v, BodyType=%s, BodyLen=%d",
-		msg.ID, msg.Subject, msg.From, msg.Body.ContentType, len(msg.Body.Content))
 
 	return msg, nil
 }
@@ -620,23 +710,8 @@ func stripHTML(s string) string {
 	return htmlTagRe.ReplaceAllString(s, "")
 }
 
-// sanitizeHTML 清理HTML中的所有脚本内容
+// sanitizeHTML 保留邮件HTML原文
 func sanitizeHTML(s string) string {
-	// 移除script标签及内容
-	s = regexp.MustCompile(`(?is)<script[\s\S]*?</script>`).ReplaceAllString(s, "")
-	// 移除未闭合的script标签
-	s = regexp.MustCompile(`(?i)<script[^>]*>`).ReplaceAllString(s, "")
-	// 移除noscript标签
-	s = regexp.MustCompile(`(?is)<noscript[\s\S]*?</noscript>`).ReplaceAllString(s, "")
-	// 移除所有on*事件属性
-	s = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*["'][^"']*["']`).ReplaceAllString(s, "")
-	s = regexp.MustCompile(`(?i)\s+on\w+\s*=\s*[^\s>]+`).ReplaceAllString(s, "")
-	// 移除javascript: URL
-	s = regexp.MustCompile(`(?i)javascript:`).ReplaceAllString(s, "blocked:")
-	// 移除vbscript: URL
-	s = regexp.MustCompile(`(?i)vbscript:`).ReplaceAllString(s, "blocked:")
-	// 移除data: URL中的脚本
-	s = regexp.MustCompile(`(?i)data:\s*text/html`).ReplaceAllString(s, "blocked:")
 	return s
 }
 

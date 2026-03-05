@@ -12,11 +12,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"outlook-mail-manager/internal/database"
 	"outlook-mail-manager/internal/models"
 	"outlook-mail-manager/internal/services"
+	"outlook-mail-manager/internal/utils"
 	"regexp"
 	"strings"
 	"sync"
@@ -106,9 +108,9 @@ func (a *App) shutdown(ctx context.Context) {
 //   - content: 包含账号信息的多行文本
 //
 // 返回值：
-//   - int: 成功导入的账号数量
+//   - *models.ImportResult: 导入结果（成功/失败统计）
 //   - error: 导入过程中的错误
-func (a *App) ImportAccounts(content string) (int, error) {
+func (a *App) ImportAccounts(content string) (*models.ImportResult, error) {
 	return a.accountSvc.Import(content)
 }
 
@@ -667,9 +669,58 @@ func (a *App) getIMAPToken(accountID int64, forceRefresh bool) (string, error) {
 	return tokenResp.AccessToken, nil
 }
 
-// ============================================================================
+// ==========================================================================
 // 系统功能 - 文件操作等系统级功能
-// ============================================================================
+// ==========================================================================
+
+// ExportAccountsFile 导出账号数据到自定义归档文件（.zgsacc）。
+func (a *App) ExportAccountsFile(content string) (bool, error) {
+	archiveData, err := utils.EncodeAccountArchive(content)
+	if err != nil {
+		return false, err
+	}
+
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		DefaultFilename: "accounts.zgsacc",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Account Archive Files", Pattern: "*.zgsacc"},
+		},
+	})
+	if err != nil || path == "" {
+		return false, err
+	}
+	return true, os.WriteFile(path, archiveData, 0644)
+}
+
+// ImportAccountsFromFile 从账号文件导入（自动支持 .zgsacc 与 .txt）。
+func (a *App) ImportAccountsFromFile() (*models.ImportResult, error) {
+	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Account Data Files", Pattern: "*.zgsacc;*.txt"},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return &models.ImportResult{}, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	if utils.IsAccountArchive(data) {
+		text, err := utils.DecodeAccountArchive(data)
+		if err != nil {
+			return nil, err
+		}
+		return a.accountSvc.Import(text)
+	}
+
+	return a.accountSvc.Import(string(data))
+}
 
 // SaveFile 保存文件对话框
 //
@@ -696,4 +747,53 @@ func (a *App) SaveFile(content string) (bool, error) {
 	}
 	// 写入文件内容
 	return true, os.WriteFile(path, []byte(content), 0644)
+}
+
+// AppInfo 应用信息模型
+//
+// 提供前端关于当前应用的基础信息展示（名称、版本、公司、版权）
+type AppInfo struct {
+	ProgramName string `json:"programName"`
+	Version     string `json:"version"`
+	Company     string `json:"company"`
+	Copyright   string `json:"copyright"`
+}
+
+// wailsConfig wails.json 配置映射
+//
+// 仅读取 info 节点中与展示相关的字段
+type wailsConfig struct {
+	Info struct {
+		CompanyName    string `json:"companyName"`
+		ProductName    string `json:"productName"`
+		ProductVersion string `json:"productVersion"`
+		Copyright      string `json:"copyright"`
+	} `json:"info"`
+}
+
+// GetAppInfo 获取应用信息
+//
+// 优先从 wails.json 的 info 配置读取；读取失败或字段缺失时回退到默认值
+func (a *App) GetAppInfo() *AppInfo {
+	cfg := wailsConfig{}
+	data, err := os.ReadFile("wails.json")
+	if err == nil {
+		if err = json.Unmarshal(data, &cfg); err == nil {
+			if cfg.Info.ProductName != "" && cfg.Info.ProductVersion != "" {
+				return &AppInfo{
+					ProgramName: cfg.Info.ProductName,
+					Version:     cfg.Info.ProductVersion,
+					Company:     cfg.Info.CompanyName,
+					Copyright:   cfg.Info.Copyright,
+				}
+			}
+		}
+	}
+
+	return &AppInfo{
+		ProgramName: "邮箱管家",
+		Version:     "1.1.0",
+		Company:     "ZGS",
+		Copyright:   "Copyright © 2026 ZGS",
+	}
 }

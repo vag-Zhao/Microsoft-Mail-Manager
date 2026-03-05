@@ -11,8 +11,11 @@ package services
 
 import (
 	"database/sql"
+	"fmt"
+	"log"
 	"outlook-mail-manager/internal/database"
 	"outlook-mail-manager/internal/models"
+	"outlook-mail-manager/internal/security"
 	"outlook-mail-manager/internal/utils"
 	"time"
 )
@@ -20,15 +23,27 @@ import (
 // AccountService 账号服务
 //
 // 提供账号相关的所有数据库操作
-// 所有方法都直接操作SQLite数据库
-type AccountService struct{}
+// 所有敏感数据（密码、Token）都会自动加密存储
+type AccountService struct {
+	encSvc *security.EncryptionService // 加密服务，用于保护敏感数据
+}
 
 // NewAccountService 创建账号服务实例
+//
+// 初始化加密服务，用于保护敏感数据
+// 如果加密服务初始化失败，应用将无法启动
 //
 // 返回值：
 //   - *AccountService: 服务实例
 func NewAccountService() *AccountService {
-	return &AccountService{}
+	// 初始化加密服务
+	encSvc, err := security.NewEncryptionService()
+	if err != nil {
+		log.Fatalf("[AccountService] 加密服务初始化失败: %v", err)
+	}
+	return &AccountService{
+		encSvc: encSvc,
+	}
 }
 
 // List 获取账号列表
@@ -67,14 +82,24 @@ func (s *AccountService) List(groupID *int64) ([]models.Account, error) {
 	var accounts []models.Account
 	for rows.Next() {
 		var a models.Account
-		var tokenExp sql.NullString   // Token过期时间可能为NULL
-		var grpID sql.NullInt64       // 分组ID可能为NULL
+		var encPassword, encRefresh, encAccess string // 加密的敏感数据
+		var tokenExp sql.NullString                   // Token过期时间可能为NULL
+		var grpID sql.NullInt64                       // 分组ID可能为NULL
 		var createdAt, updatedAt sql.NullString
-		err := rows.Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken, &a.AccessToken,
+
+		// 扫描数据库行
+		err := rows.Scan(&a.ID, &a.Email, &encPassword, &a.ClientID, &encRefresh, &encAccess,
 			&tokenExp, &grpID, &a.GroupName, &a.DisplayName, &a.Status, &a.Protocol, &a.LastError, &createdAt, &updatedAt)
 		if err != nil {
 			continue // 跳过解析失败的行
 		}
+
+		// 解密敏感字段
+		// 注意：解密失败时返回空字符串，不影响其他数据的读取
+		a.Password, _ = s.encSvc.Decrypt(encPassword)
+		a.RefreshToken, _ = s.encSvc.Decrypt(encRefresh)
+		a.AccessToken, _ = s.encSvc.Decrypt(encAccess)
+
 		// 处理可空的分组ID
 		if grpID.Valid {
 			a.GroupID = &grpID.Int64
@@ -88,25 +113,35 @@ func (s *AccountService) List(groupID *int64) ([]models.Account, error) {
 //
 // 用于获取账号的完整信息，包括Token和过期时间
 // 主要用于Token刷新流程
+// 所有敏感数据会自动解密
 //
 // 参数：
 //   - id: 账号ID
 //
 // 返回值：
-//   - *models.Account: 账号详情
+//   - *models.Account: 账号详情（敏感数据已解密）
 //   - error: 账号不存在或数据库错误
 func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 	var a models.Account
+	var encPassword, encRefresh, encAccess string // 加密的敏感数据
 	// 使用sql.NullXxx类型处理可空字段
-	var tokenExp, displayName, lastErr, accessToken, protocol sql.NullString
+	var tokenExp, displayName, lastErr, protocol sql.NullString
 	var grpID sql.NullInt64
-	err := database.DB.QueryRow(`SELECT id, email, COALESCE(password,''), client_id, COALESCE(refresh_token,''), access_token,
+
+	// 查询账号信息
+	err := database.DB.QueryRow(`SELECT id, email, COALESCE(password,''), client_id, COALESCE(refresh_token,''), COALESCE(access_token,''),
 		token_expires_at, group_id, display_name, COALESCE(status,'active'), protocol, last_error FROM accounts WHERE id = ?`, id).
-		Scan(&a.ID, &a.Email, &a.Password, &a.ClientID, &a.RefreshToken, &accessToken,
+		Scan(&a.ID, &a.Email, &encPassword, &a.ClientID, &encRefresh, &encAccess,
 			&tokenExp, &grpID, &displayName, &a.Status, &protocol, &lastErr)
 	if err != nil {
 		return nil, err
 	}
+
+	// 解密敏感字段
+	a.Password, _ = s.encSvc.Decrypt(encPassword)
+	a.RefreshToken, _ = s.encSvc.Decrypt(encRefresh)
+	a.AccessToken, _ = s.encSvc.Decrypt(encAccess)
+
 	// 处理可空字段
 	if grpID.Valid {
 		a.GroupID = &grpID.Int64
@@ -114,12 +149,13 @@ func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 	if displayName.Valid {
 		a.DisplayName = displayName.String
 	}
-	if accessToken.Valid {
-		a.AccessToken = accessToken.String
-	}
 	if protocol.Valid {
 		a.Protocol = protocol.String
 	}
+	if lastErr.Valid {
+		a.LastError = lastErr.String
+	}
+
 	// 解析Token过期时间（RFC3339格式）
 	if tokenExp.Valid {
 		t, _ := time.Parse(time.RFC3339, tokenExp.String)
@@ -128,10 +164,11 @@ func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 	return &a, nil
 }
 
-// Import 批量导入账号
+// Import 批量导入账号（返回详细结果）
 //
 // 解析用户输入的文本，批量创建或更新账号
-// 使用INSERT OR REPLACE实现存在则更新、不存在则插入
+// 使用 INSERT ... ON CONFLICT 实现存在则更新、不存在则插入
+// 所有敏感数据会自动加密存储
 //
 // 支持的文本格式：
 // - 邮箱----密码----ClientID----RefreshToken----分组名
@@ -141,25 +178,124 @@ func (s *AccountService) GetByID(id int64) (*models.Account, error) {
 //   - text: 包含账号信息的多行文本
 //
 // 返回值：
-//   - int: 成功导入的账号数量
-//   - error: 始终返回nil（错误在内部处理）
-func (s *AccountService) Import(text string) (int, error) {
+//   - *models.ImportResult: 导入结果，包含成功/失败统计和错误详情
+//   - error: 事务失败等严重错误
+//
+// 改进点：
+//   - 返回详细的导入结果，用户可以看到哪些账号失败了
+//   - 收集解析错误和导入错误
+//   - 使用事务保证原子性
+//   - 使用 ON CONFLICT 保留原 ID 和其他字段
+//   - 敏感数据自动加密
+func (s *AccountService) Import(text string) (*models.ImportResult, error) {
 	// 调用解析工具解析文本
-	accounts, groupNames, _ := utils.ParseAccountsText(text)
-	count := 0
+	accounts, groupNames, parseErrors := utils.ParseAccountsText(text)
+
+	// 初始化结果
+	result := &models.ImportResult{
+		Total:  len(accounts),
+		Errors: make([]models.ImportError, 0),
+	}
+
+	// 添加解析错误
+	for _, err := range parseErrors {
+		result.Errors = append(result.Errors, models.ImportError{
+			Line:   0, // 解析错误没有具体行号
+			Reason: err.Error(),
+		})
+	}
+
+	// 开启事务
+	tx, err := database.DB.Begin()
+	if err != nil {
+		return result, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() // 如果提交失败，自动回滚
+
+	// 逐个导入账号
 	for i, acc := range accounts {
 		// 确保分组存在（不存在则创建）
-		groupID := s.ensureGroup(groupNames[i])
-		// INSERT OR REPLACE：邮箱唯一，存在则更新
-		_, err := database.DB.Exec(`INSERT OR REPLACE INTO accounts
-			(email, password, client_id, refresh_token, group_id, status, updated_at)
-			VALUES (?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP)`,
-			acc.Email, acc.Password, acc.ClientID, acc.RefreshToken, groupID)
-		if err == nil {
-			count++
+		groupID := s.ensureGroupTx(tx, groupNames[i])
+
+		// 加密敏感数据
+		encPassword, err := s.encSvc.Encrypt(acc.Password)
+		if err != nil {
+			result.Errors = append(result.Errors, models.ImportError{
+				Email:  acc.Email,
+				Line:   i + 1,
+				Reason: fmt.Sprintf("加密密码失败: %v", err),
+			})
+			continue
+		}
+		encRefresh, err := s.encSvc.Encrypt(acc.RefreshToken)
+		if err != nil {
+			result.Errors = append(result.Errors, models.ImportError{
+				Email:  acc.Email,
+				Line:   i + 1,
+				Reason: fmt.Sprintf("加密RefreshToken失败: %v", err),
+			})
+			continue
+		}
+
+		// 使用 INSERT ... ON CONFLICT 替代 INSERT OR REPLACE
+		// 优点：保留原 ID、保留其他字段（如 access_token、protocol 等）
+		_, err = tx.Exec(`INSERT INTO accounts
+			(email, password, client_id, refresh_token, group_id, status, encrypted, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 'active', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+			ON CONFLICT(email) DO UPDATE SET
+				password = excluded.password,
+				client_id = excluded.client_id,
+				refresh_token = excluded.refresh_token,
+				group_id = excluded.group_id,
+				encrypted = 1,
+				updated_at = CURRENT_TIMESTAMP
+			WHERE email = excluded.email`,
+			acc.Email, encPassword, acc.ClientID, encRefresh, groupID)
+
+		if err != nil {
+			result.Errors = append(result.Errors, models.ImportError{
+				Email:  acc.Email,
+				Line:   i + 1,
+				Reason: fmt.Sprintf("数据库操作失败: %v", err),
+			})
+		} else {
+			result.Success++
 		}
 	}
-	return count, nil
+
+	// 计算失败数量
+	result.Failed = len(result.Errors)
+
+	// 提交事务
+	if err := tx.Commit(); err != nil {
+		return result, fmt.Errorf("commit transaction: %w", err)
+	}
+
+	return result, nil
+}
+
+// ensureGroupTx 在事务中确保分组存在
+//
+// 内部方法，用于导入账号时自动创建分组
+// 如果分组已存在则返回其ID，否则创建新分组
+//
+// 参数：
+//   - tx: 数据库事务
+//   - name: 分组名称
+//
+// 返回值：
+//   - int64: 分组ID
+func (s *AccountService) ensureGroupTx(tx *sql.Tx, name string) int64 {
+	var id int64
+	// 先查询是否存在
+	err := tx.QueryRow("SELECT id FROM groups WHERE name = ?", name).Scan(&id)
+	if err == nil {
+		return id // 已存在，返回ID
+	}
+	// 不存在，创建新分组
+	res, _ := tx.Exec("INSERT INTO groups (name) VALUES (?)", name)
+	id, _ = res.LastInsertId()
+	return id
 }
 
 // ensureGroup 确保分组存在
@@ -200,19 +336,31 @@ func (s *AccountService) Delete(id int64) error {
 // UpdateToken 更新账号的Token信息
 //
 // Token刷新成功后调用，同时更新状态为active并清除错误信息
+// 所有Token会自动加密存储
 //
 // 参数：
 //   - id: 账号ID
-//   - accessToken: 新的访问令牌
-//   - refreshToken: 新的刷新令牌（可能会更新）
+//   - accessToken: 新的访问令牌（明文）
+//   - refreshToken: 新的刷新令牌（明文，可能会更新）
 //   - expiresAt: Token过期时间
 //
 // 返回值：
 //   - error: 更新失败时返回错误
 func (s *AccountService) UpdateToken(id int64, accessToken, refreshToken string, expiresAt time.Time) error {
-	_, err := database.DB.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?,
-		token_expires_at = ?, status = 'active', last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		accessToken, refreshToken, expiresAt.Format(time.RFC3339), id)
+	// 加密Token
+	encAccess, err := s.encSvc.Encrypt(accessToken)
+	if err != nil {
+		return fmt.Errorf("encrypt access token: %w", err)
+	}
+	encRefresh, err := s.encSvc.Encrypt(refreshToken)
+	if err != nil {
+		return fmt.Errorf("encrypt refresh token: %w", err)
+	}
+
+	// 更新数据库
+	_, err = database.DB.Exec(`UPDATE accounts SET access_token = ?, refresh_token = ?,
+		token_expires_at = ?, status = 'active', last_error = NULL, encrypted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		encAccess, encRefresh, expiresAt.Format(time.RFC3339), id)
 	return err
 }
 

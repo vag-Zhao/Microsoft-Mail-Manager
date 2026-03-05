@@ -6,11 +6,26 @@ declare module '*.vue' {
   export default component
 }
 
+interface ImportError {
+  email?: string
+  line: number
+  reason: string
+}
+
+interface ImportResult {
+  total: number
+  success: number
+  failed: number
+  errors: ImportError[]
+}
+
 interface Window {
   go: {
     main: {
       App: {
-        ImportAccounts(content: string): Promise<number>
+        ImportAccounts(content: string): Promise<ImportResult>
+        ImportAccountsFromFile(): Promise<ImportResult>
+        ExportAccountsFile(content: string): Promise<boolean>
         GetAccounts(groupId: number | null): Promise<any[]>
         DeleteAccount(id: number): Promise<void>
         DeleteAccounts(ids: number[]): Promise<void>
@@ -30,7 +45,6 @@ interface Window {
         GetAttachments(accountId: number, messageId: string): Promise<any[]>
         DeleteMessage(accountId: number, messageId: string): Promise<void>
         MarkMessageRead(accountId: number, messageId: string, isRead: boolean): Promise<void>
-        SaveFile(content: string): Promise<boolean>
       }
     }
   }

@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // TokenResponse OAuth2令牌响应结构
@@ -51,6 +52,8 @@ const (
 	// 注意：REST API不需要显式设置scope，使用原始token权限即可
 	ScopeIMAP = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
 )
+
+var oauthHTTPClient = &http.Client{Timeout: 20 * time.Second}
 
 // RefreshAccessToken 刷新访问令牌（REST API，不设置scope使用原始权限）
 func RefreshAccessToken(clientID, refreshToken string) (*TokenResponse, error) {
@@ -109,7 +112,12 @@ func refreshWithEndpoint(clientID, refreshToken, scope, tenant string) (*TokenRe
 	}
 
 	// 发送POST请求，Content-Type为application/x-www-form-urlencoded
-	resp, err := http.Post(endpoint, "application/x-www-form-urlencoded", strings.NewReader(data.Encode()))
+	req, err := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("build request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := oauthHTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}

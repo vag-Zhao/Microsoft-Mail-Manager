@@ -18,12 +18,19 @@
 // ============================================================================
 // 依赖导入
 // ============================================================================
-import { ref, onMounted, watch, computed } from 'vue'  // Vue3 Composition API
+import { ref, onMounted, onBeforeUnmount, watch, computed, nextTick } from 'vue'  // Vue3 Composition API
 import { useAccountStore } from './stores/account'      // 账号状态管理
 import { useMailStore } from './stores/mail'            // 邮件状态管理
 import { formatDate } from './lib/utils'                // 日期格式化工具
 // Lucide图标组件
-import { Mail, Folder, Users, Plus, Trash2, Upload, ChevronRight, Paperclip, RefreshCw, Copy } from 'lucide-vue-next'
+import { Mail, Folder, Users, Plus, Trash2, Upload, ChevronRight, Paperclip, RefreshCw, Copy, Info } from 'lucide-vue-next'
+
+interface AppInfo {
+  programName: string
+  version: string
+  company: string
+  copyright: string
+}
 
 // ============================================================================
 // Store实例
@@ -38,7 +45,6 @@ const currentView = ref<'mail' | 'manage'>('mail')  // 当前视图：mail=邮�
 // 深色模式：从localStorage读取初始值，变化时自动保存
 const darkMode = ref(localStorage.getItem('darkMode') === 'true')
 watch(darkMode, (val) => localStorage.setItem('darkMode', String(val)))
-const soldStatus = ref<Record<number, boolean>>({})   // 账号已售状态映射（内存中，不持久化）
 const activeRowId = ref<number | null>(null)          // 当前激活的表格行ID（用于高亮）
 const selectedIds = ref<Set<number>>(new Set())       // 批量选中的账号ID集合
 
@@ -57,42 +63,22 @@ const allSelected = computed(() => {
 
 /**
  * 统计数据
- * 计算当前筛选账号的各项统计指标
- * - total: 总数
- * - active: 正常状态数量
- * - error: 异常状态数量
- * - sold: 已售数量
- * - unsold: 未售数量
  */
 const stats = computed(() => {
   const accounts = accountStore.filteredAccounts
-  const total = accounts.length
-  const active = accounts.filter(a => a.status === 'active').length
-  const error = total - active
-  const sold = accounts.filter(a => soldStatus.value[a.id]).length
-  const unsold = total - sold
-  return { total, active, error, sold, unsold }
+  return {
+    total: accounts.length,
+    selected: selectedIds.value.size,
+    groups: accountStore.groups.length,
+  }
 })
 
 /**
  * 邮件内容HTML
- * 生成用于iframe显示的完整HTML文档
- * 深色模式下使用CSS filter反转颜色
+ * 保留邮件原始HTML，避免影响源显示格式和布局
  */
 const emailHtmlContent = computed(() => {
-  if (!mailStore.currentMessage?.body?.content) return ''
-  // 彻底清理所有可执行脚本内容
-  let clean = mailStore.currentMessage.body.content
-    .replace(/<script[\s\S]*?<\/script>/gi, '')  // script标签
-    .replace(/<script[^>]*>/gi, '')               // 未闭合的script
-    .replace(/\son\w+\s*=\s*["'][^"']*["']/gi, '') // onclick等事件
-    .replace(/\son\w+\s*=\s*[^\s>]+/gi, '')       // 无引号的事件
-    .replace(/javascript:/gi, 'blocked:')         // javascript: URL
-  // 深色模式样式：反转颜色，图片二次反转保持原色
-  const darkStyles = darkMode.value
-    ? 'html{filter:invert(1) hue-rotate(180deg);}img{filter:invert(1) hue-rotate(180deg);}'
-    : ''
-  return `<html><head><meta charset="utf-8"><style>${darkStyles}body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;margin:16px;padding:0;font-size:14px;line-height:1.6;}img{max-width:100%;}a{color:#3b82f6;}::-webkit-scrollbar{display:none;}body{-ms-overflow-style:none;scrollbar-width:none;}</style></head><body>${clean}</body></html>`
+  return mailStore.currentMessage?.body?.content || ''
 })
 
 // ============================================================================
@@ -154,14 +140,15 @@ function generatePassword(email: string): string {
 // ============================================================================
 // UI状态变量
 // ============================================================================
-const showImport = ref(false)           // 是否显示导入弹窗
-const importText = ref('')              // 导入文本框内容
 const importLoading = ref(false)        // 导入中加载状态
 const newGroupName = ref('')            // 新建分组名称输入
 const showNewGroup = ref(false)         // 是否显示新建分组输入框
 const searchKeyword = ref('')           // 账号搜索关键词
-const statusFilter = ref<'all' | 'active' | 'error' | 'sold' | 'unsold'>('all')  // 状态筛选器
 const toast = ref<{ message: string; type: 'success' | 'error' } | null>(null)  // Toast提示状态
+const showAboutModal = ref(false)
+const appInfo = ref<AppInfo | null>(null)
+const emailIframeRef = ref<HTMLIFrameElement | null>(null)
+const emailIframeReady = ref(false)
 
 /**
  * 显示Toast提示
@@ -191,20 +178,10 @@ const filteredMessages = computed(() => {
 
 /**
  * 搜索过滤账号
- * 根据状态筛选和关键词搜索过滤账号列表
+ * 根据关键词搜索过滤账号列表
  */
 const searchedAccounts = computed(() => {
   let accounts = accountStore.filteredAccounts
-  // 状态筛选
-  if (statusFilter.value === 'active') {
-    accounts = accounts.filter(a => a.status === 'active')
-  } else if (statusFilter.value === 'error') {
-    accounts = accounts.filter(a => a.status !== 'active')
-  } else if (statusFilter.value === 'sold') {
-    accounts = accounts.filter(a => soldStatus.value[a.id])
-  } else if (statusFilter.value === 'unsold') {
-    accounts = accounts.filter(a => !soldStatus.value[a.id])
-  }
   // 关键词搜索（匹配邮箱）
   const keyword = searchKeyword.value.trim().toLowerCase()
   if (keyword) {
@@ -216,8 +193,10 @@ const searchedAccounts = computed(() => {
 // ============================================================================
 // 右键菜单和确认弹窗
 // ============================================================================
-const contextMenu = ref<{ type: 'account' | 'group'; id: number; x: number; y: number } | null>(null)  // 右键菜单状态
+const contextMenu = ref<{ type: 'account' | 'group'; id: number; x: number; y: number; flipX: boolean; flipY: boolean; maxHeight: number } | null>(null)  // 右键菜单状态
 const confirmModal = ref<{ message: string; onConfirm: () => void } | null>(null)  // 确认弹窗状态
+const showMoveGroupMenu = ref(false)
+const submenuOffsetY = ref(0)
 
 /**
  * 显示确认弹窗
@@ -242,12 +221,97 @@ function handleConfirm() {
  */
 function showContextMenu(e: MouseEvent, type: 'account' | 'group', id: number) {
   e.preventDefault()
-  contextMenu.value = { type, id, x: e.clientX, y: e.clientY }
+  showMoveGroupMenu.value = false
+  contextMenu.value = { type, id, x: e.clientX, y: e.clientY, flipX: false, flipY: false, maxHeight: 320 }
+
+  window.addEventListener('resize', handleWindowResize)
+  // Adjust position after render
+  nextTick(() => adjustMenuPosition())
 }
+
+/**
+ * 调整右键菜单位置，防止溢出视口
+ */
+function adjustMenuPosition() {
+  if (!contextMenu.value) return
+
+  const menuEl = document.querySelector('.context-menu') as HTMLElement
+  if (!menuEl) return
+
+  const menuRect = menuEl.getBoundingClientRect()
+  const viewportWidth = window.innerWidth
+  const viewportHeight = window.innerHeight
+  const padding = 8
+
+  let x = contextMenu.value.x
+  let y = contextMenu.value.y
+  let flipX = false
+  let flipY = false
+
+  // Check right edge overflow
+  if (x + menuRect.width > viewportWidth - padding) {
+    x = x - menuRect.width
+    flipX = true
+  }
+
+  // Check bottom edge overflow
+  if (y + menuRect.height > viewportHeight - padding) {
+    y = y - menuRect.height
+    flipY = true
+  }
+
+  // Ensure within bounds
+  x = Math.max(padding, Math.min(x, viewportWidth - menuRect.width - padding))
+  y = Math.max(padding, Math.min(y, viewportHeight - menuRect.height - padding))
+
+  const availableHeight = Math.max(120, viewportHeight - y - padding)
+  contextMenu.value = { ...contextMenu.value, x, y, flipX, flipY, maxHeight: availableHeight }
+}
+
+function handleWindowResize() {
+  if (!contextMenu.value) return
+  nextTick(() => {
+    adjustMenuPosition()
+    if (showMoveGroupMenu.value) {
+      adjustSubmenuPosition()
+    }
+  })
+}
+
+function toggleMoveGroupMenu() {
+  showMoveGroupMenu.value = !showMoveGroupMenu.value
+  submenuOffsetY.value = 0
+  if (showMoveGroupMenu.value) {
+    nextTick(() => adjustSubmenuPosition())
+  }
+}
+
+function adjustSubmenuPosition() {
+  const submenuEl = document.querySelector('.submenu') as HTMLElement
+  if (!submenuEl) return
+
+  const viewportHeight = window.innerHeight
+  const padding = 8
+  const rect = submenuEl.getBoundingClientRect()
+
+  let offset = 0
+  if (rect.bottom > viewportHeight - padding) {
+    offset -= (rect.bottom - (viewportHeight - padding))
+  }
+  if (rect.top + offset < padding) {
+    offset += (padding - (rect.top + offset))
+  }
+
+  submenuOffsetY.value = offset
+}
+
 
 /** 隐藏右键菜单 */
 function hideContextMenu() {
+  showMoveGroupMenu.value = false
+  submenuOffsetY.value = 0
   contextMenu.value = null
+  window.removeEventListener('resize', handleWindowResize)
 }
 
 // ============================================================================
@@ -324,6 +388,21 @@ async function deleteGroup(id: number) {
   hideContextMenu()
 }
 
+async function openAboutModal() {
+  try {
+    // @ts-ignore
+    appInfo.value = await window.go.main.App.GetAppInfo()
+  } catch {
+    appInfo.value = {
+      programName: '邮箱管家',
+      version: '1.1.0',
+      company: 'ZGS',
+      copyright: 'Copyright © 2026 ZGS'
+    }
+  }
+  showAboutModal.value = true
+}
+
 // ============================================================================
 // 生命周期和监听器
 // ============================================================================
@@ -351,6 +430,10 @@ onMounted(async () => {
   await accountStore.loadAccounts()
 })
 
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', handleWindowResize)
+})
+
 /**
  * 监听选中账号变化
  * 切换账号时重置邮件状态并加载新账号的文件夹
@@ -365,23 +448,64 @@ watch(() => accountStore.selectedAccountId, async (id) => {
   }
 })
 
+function applyIframeScrollbarStyle() {
+  const iframe = emailIframeRef.value
+  if (!iframe) return
+
+  try {
+    const doc = iframe.contentDocument
+    if (!doc) {
+      emailIframeReady.value = true
+      return
+    }
+
+    let styleEl = doc.getElementById('mail-hide-scrollbar-style') as HTMLStyleElement | null
+    if (!styleEl) {
+      styleEl = doc.createElement('style')
+      styleEl.id = 'mail-hide-scrollbar-style'
+      doc.head?.appendChild(styleEl)
+    }
+
+    styleEl.textContent = `
+      html, body, * {
+        scrollbar-width: none !important;
+        -ms-overflow-style: none !important;
+      }
+      html::-webkit-scrollbar,
+      body::-webkit-scrollbar,
+      *::-webkit-scrollbar {
+        width: 0 !important;
+        height: 0 !important;
+        display: none !important;
+      }
+    `
+  } catch {
+    // ignore cross-document style errors
+  } finally {
+    emailIframeReady.value = true
+  }
+}
+
+watch(() => mailStore.currentMessage?.id, async () => {
+  emailIframeReady.value = false
+  await nextTick()
+  applyIframeScrollbarStyle()
+})
+
 // ============================================================================
 // 导入和邮件操作函数
 // ============================================================================
 
 /**
- * 处理账号导入
- * 解析文本框内容，批量导入账号
+ * 导入账号文件（自动支持 .zgsacc 与 .txt）
  */
-async function handleImport() {
-  if (!importText.value.trim()) return
-  console.log(`[App.vue] handleImport: 开始导入`)
+async function importAccountFile() {
   importLoading.value = true
   try {
-    const count = await accountStore.importAccounts(importText.value)
-    showToast(`成功导入 ${count} 个账号`, 'success')
-    showImport.value = false
-    importText.value = ''
+    const result = await (window as any).go.main.App.ImportAccountsFromFile()
+    await accountStore.loadAccounts()
+    await accountStore.loadGroups()
+    showToast(`导入完成：成功 ${result?.success || 0}，失败 ${result?.failed || 0}`, 'success')
   } catch (e: any) {
     showToast('导入失败: ' + e, 'error')
   } finally {
@@ -443,14 +567,6 @@ async function deleteAccount(id: number) {
   })
 }
 
-/**
- * 切换账号已售状态
- * @param id - 账号ID
- */
-function toggleSold(id: number) {
-  soldStatus.value[id] = !soldStatus.value[id]
-}
-
 // ============================================================================
 // 批量操作函数
 // ============================================================================
@@ -482,15 +598,6 @@ async function batchMoveToGroup(groupId: number) {
   await accountStore.loadAccounts()
   await accountStore.loadGroups()
   showToast('移动成功', 'success')
-}
-
-/**
- * 批量标记选中账号为已售
- */
-function batchMarkSold() {
-  if (selectedIds.value.size === 0) return
-  selectedIds.value.forEach(id => soldStatus.value[id] = true)
-  showToast(`已标记 ${selectedIds.value.size} 个为已售`, 'success')
 }
 
 // ============================================================================
@@ -558,10 +665,32 @@ async function exportAccounts() {
   console.log(`[App.vue] exportAccounts: count=${accountStore.filteredAccounts.length}`)
   const lines = accountStore.filteredAccounts.map(acc => `${acc.email},${generatePassword(acc.email)}`)
   const text = lines.join('\n')
-  const result = await (window as any).go.main.App.SaveFile(text)
+  const result = await (window as any).go.main.App.ExportAccountsFile(text)
   if (result) {
     showToast(`已导出 ${lines.length} 个账号`, 'success')
   }
+}
+
+/**
+ * 导出单个账号（完整导入格式）
+ * 格式：邮箱----密码----clientId----refreshToken----分组名
+ * @param accountId - 账号ID
+ */
+async function exportSingleAccount(accountId: number) {
+  const acc = accountStore.accounts.find(a => a.id === accountId)
+  if (!acc) {
+    showToast('账号不存在', 'error')
+    hideContextMenu()
+    return
+  }
+
+  const groupName = accountStore.groups.find(g => g.id === acc.groupId)?.name || acc.groupName || '默认分组'
+  const line = `${acc.email}----${acc.password || ''}----${acc.clientId}----${acc.refreshToken || ''}----${groupName}`
+  const result = await (window as any).go.main.App.ExportAccountsFile(line)
+  if (result) {
+    showToast('已导出 1 个账号', 'success')
+  }
+  hideContextMenu()
 }
 
 /**
@@ -575,7 +704,7 @@ async function exportGroupAccounts(groupId: number) {
   const groupAccounts = accountStore.accounts.filter(a => a.groupId === groupId)
   const lines = groupAccounts.map(acc => `${acc.email}----${acc.password || ''}----${acc.clientId}----${acc.refreshToken || ''}----${groupName}`)
   const text = lines.join('\n')
-  const result = await (window as any).go.main.App.SaveFile(text)
+  const result = await (window as any).go.main.App.ExportAccountsFile(text)
   if (result) {
     showToast(`已导出 ${lines.length} 个账号`, 'success')
   }
@@ -607,7 +736,11 @@ function downloadAttachment(att: any) {
             class="text-lg font-semibold flex items-center gap-2 cursor-pointer hover:text-blue-500 transition-colors">
             <Mail class="w-5 h-5 text-blue-500" /> 邮箱管家
           </h1>
-          <button @click="showImport = true" :class="['p-2 rounded-lg', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100', currentView !== 'mail' ? 'invisible' : '']" title="导入账号">
+          <button
+            @click="importAccountFile"
+            :disabled="importLoading"
+            :class="['p-2 rounded-lg', darkMode ? 'hover:bg-gray-700 disabled:opacity-50' : 'hover:bg-gray-100 disabled:opacity-50', currentView !== 'mail' ? 'invisible' : '']"
+            title="导入账号文件">
             <Upload class="w-4 h-4" />
           </button>
         </div>
@@ -767,8 +900,11 @@ function downloadAttachment(att: any) {
         <!-- 邮件正文 -->
         <div class="flex-1 overflow-hidden">
           <iframe v-if="mailStore.currentMessage.body?.contentType?.toLowerCase() === 'html'"
+            ref="emailIframeRef"
+            @load="applyIframeScrollbarStyle"
             :srcdoc="emailHtmlContent"
-            class="w-full h-full border-0" sandbox="allow-same-origin"></iframe>
+            :class="['w-full h-full border-0 hide-scrollbar', emailIframeReady ? '' : 'invisible']"
+            sandbox="allow-same-origin"></iframe>
           <pre v-else :class="['whitespace-pre-wrap text-sm p-4 h-full overflow-auto hide-scrollbar', darkMode ? 'text-gray-200' : '']">{{ mailStore.currentMessage.body?.content || mailStore.currentMessage.bodyPreview }}</pre>
         </div>
       </template>
@@ -780,45 +916,29 @@ function downloadAttachment(att: any) {
     <!-- 管理视图 -->
     <main v-if="currentView === 'manage'" :class="['flex-1 flex flex-col overflow-hidden', darkMode ? 'bg-gray-900 text-gray-200' : 'bg-white']">
       <!-- 统计卡片 -->
-      <div :class="['p-4 border-b shrink-0 grid grid-cols-5 gap-3', darkMode ? 'border-gray-700' : '']">
+      <div :class="['p-4 border-b shrink-0 grid grid-cols-3 gap-3', darkMode ? 'border-gray-700' : '']">
         <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-gray-800' : 'bg-gray-50']">
           <div :class="['text-2xl font-bold', darkMode ? 'text-gray-200' : 'text-gray-700']">{{ stats.total }}</div>
           <div class="text-xs text-gray-500">总账号</div>
         </div>
-        <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-green-900/30' : 'bg-green-50']">
-          <div class="text-2xl font-bold text-green-500">{{ stats.active }}</div>
-          <div class="text-xs text-gray-500">正常</div>
-        </div>
-        <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-red-900/30' : 'bg-red-50']">
-          <div class="text-2xl font-bold text-red-500">{{ stats.error }}</div>
-          <div class="text-xs text-gray-500">异常</div>
+        <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-blue-900/30' : 'bg-blue-50']">
+          <div class="text-2xl font-bold text-blue-500">{{ stats.selected }}</div>
+          <div class="text-xs text-gray-500">已选中</div>
         </div>
         <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-gray-800' : 'bg-gray-100']">
-          <div :class="['text-2xl font-bold', darkMode ? 'text-gray-300' : 'text-gray-600']">{{ stats.sold }}</div>
-          <div class="text-xs text-gray-500">已售</div>
-        </div>
-        <div :class="['rounded-lg p-3 text-center', darkMode ? 'bg-blue-900/30' : 'bg-blue-50']">
-          <div class="text-2xl font-bold text-blue-500">{{ stats.unsold }}</div>
-          <div class="text-xs text-gray-500">未售</div>
+          <div :class="['text-2xl font-bold', darkMode ? 'text-gray-300' : 'text-gray-600']">{{ stats.groups }}</div>
+          <div class="text-xs text-gray-500">分组数</div>
         </div>
       </div>
       <div :class="['p-4 border-b shrink-0 flex items-center justify-between', darkMode ? 'border-gray-700' : '']">
         <div class="flex items-center gap-2">
           <h2 class="text-lg font-semibold">账号管理</h2>
-          <select v-model="statusFilter" :class="['text-xs border rounded px-2 py-1', darkMode ? 'bg-gray-700 border-gray-600 text-gray-200' : '']">
-            <option value="all">全部</option>
-            <option value="active">正常</option>
-            <option value="error">异常</option>
-            <option value="sold">已售</option>
-            <option value="unsold">未售</option>
-          </select>
           <span v-if="selectedIds.size > 0" class="text-xs text-gray-500">(已选 {{ selectedIds.size }})</span>
         </div>
         <div class="flex items-center gap-2">
           <template v-if="selectedIds.size > 0">
-            <button @click="batchMarkSold" class="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200">标记已售</button>
             <div class="relative group">
-              <button class="px-2 py-1 text-xs bg-gray-100 rounded hover:bg-gray-200">移动分组</button>
+              <button :class="['px-2 py-1 text-xs rounded border', darkMode ? 'bg-gray-700 text-gray-100 border-gray-500 hover:bg-gray-600' : 'bg-gray-100 text-gray-700 border-gray-300 hover:bg-gray-200']">移动分组</button>
               <div :class="['absolute right-0 top-full pt-1 hidden group-hover:block z-20']">
                 <div :class="['border rounded shadow-lg py-1 min-w-[100px]', darkMode ? 'bg-gray-800 border-gray-700' : 'bg-white']">
                   <button v-for="g in accountStore.groups" :key="g.id" @click="batchMoveToGroup(g.id)"
@@ -856,10 +976,9 @@ function downloadAttachment(att: any) {
                 <span @click="copyText(generatePassword(acc.email), '已复制密码', acc.id)" class="font-mono text-xs cursor-pointer hover:text-blue-500">{{ generatePassword(acc.email) }}</span>
               </td>
               <td class="px-3 py-2 text-center">
-                <button @click="toggleSold(acc.id)"
-                  :class="['px-2 py-0.5 text-xs rounded', soldStatus[acc.id] ? 'bg-gray-200 text-gray-600' : 'bg-green-100 text-green-600']">
-                  {{ soldStatus[acc.id] ? '已售' : '未售' }}
-                </button>
+                <span :class="['text-xs', acc.status === 'active' ? 'text-green-500' : 'text-red-500']">
+                  {{ acc.status === 'active' ? '正常' : '异常' }}
+                </span>
               </td>
               <td class="px-3 py-2 text-center">
                 <button @click="copyAccountInfo(acc)" :class="['p-1 rounded', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']" title="复制">
@@ -898,34 +1017,38 @@ function downloadAttachment(att: any) {
           <span v-if="darkMode">☀️ 浅色</span>
           <span v-else>🌙 深色</span>
         </button>
+        <button @click="openAboutModal"
+          :class="['flex items-center gap-1.5 px-2 py-0.5 rounded transition-colors', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
+          <Info class="w-3.5 h-3.5" />
+          <span>关于</span>
+        </button>
       </div>
     </footer>
 
-    <!-- 导入弹窗 -->
-    <div v-if="showImport" @click.self="showImport = false" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div :class="['rounded-xl shadow-xl w-[600px] max-h-[80vh] flex flex-col', darkMode ? 'bg-gray-800 text-gray-200' : 'bg-white']">
-        <div :class="['p-4 border-b flex items-center justify-between', darkMode ? 'border-gray-700' : '']">
-          <h3 class="font-semibold">批量导入账号</h3>
-          <button @click="showImport = false" :class="['p-1 rounded', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">&times;</button>
-        </div>
-        <div class="p-4 flex-1 overflow-auto">
-          <textarea v-model="importText" rows="10" placeholder="粘贴账号数据..."
-            :class="['w-full p-3 border rounded-lg text-sm font-mono resize-none focus:outline-none focus:ring-2 focus:ring-blue-500', darkMode ? 'bg-gray-700 border-gray-600 text-gray-200' : '']"></textarea>
-        </div>
-        <div :class="['p-4 border-t flex justify-end gap-2', darkMode ? 'border-gray-700' : '']">
-          <button @click="showImport = false" :class="['px-4 py-2 text-sm rounded-lg', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">取消</button>
-          <button @click="handleImport" :disabled="importLoading"
-            class="px-4 py-2 text-sm bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50">
-            {{ importLoading ? '导入中...' : '导入' }}
-          </button>
+
+
+    <!-- 关于弹窗 -->
+    <Transition name="modal-fade">
+      <div v-if="showAboutModal" @click.self="showAboutModal = false" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <div :class="['rounded-lg shadow-xl w-[360px] p-5', darkMode ? 'bg-gray-800 text-gray-200' : 'bg-white']">
+          <div class="mb-4">
+            <h3 class="font-semibold">关于</h3>
+          </div>
+          <div class="space-y-2 text-sm">
+            <div><span class="text-gray-500">程序名：</span>{{ appInfo?.programName || '邮箱管家' }}</div>
+            <div><span class="text-gray-500">版本号：</span>{{ appInfo?.version || '1.1.0' }}</div>
+            <div><span class="text-gray-500">公司名：</span>{{ appInfo?.company || 'ZGS' }}</div>
+            <div><span class="text-gray-500">Copyright：</span>{{ appInfo?.copyright || 'Copyright © 2026 ZGS' }}</div>
+          </div>
         </div>
       </div>
-    </div>
+    </Transition>
 
     <!-- 右键菜单 -->
-    <div v-if="contextMenu" @click="hideContextMenu" class="fixed inset-0 z-50">
-      <div :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
-        :class="['absolute border rounded shadow-lg py-1 min-w-[120px]', darkMode ? 'bg-gray-800 border-gray-700 text-gray-200' : 'bg-white']" @click.stop>
+    <Transition name="menu-pop">
+      <div v-if="contextMenu" @click="hideContextMenu" class="fixed inset-0 z-50">
+        <div :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px', maxHeight: contextMenu.maxHeight + 'px' }"
+          :class="['context-menu absolute border rounded shadow-lg py-1 min-w-[120px] overflow-visible', darkMode ? 'bg-gray-800 border-gray-700 text-gray-200' : 'bg-white']" @click.stop>
         <template v-if="contextMenu.type === 'group'">
           <button @click="exportGroupAccounts(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
             导出分组
@@ -941,25 +1064,51 @@ function downloadAttachment(att: any) {
           <button @click="copyAccountEmail(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
             复制邮箱
           </button>
-          <div class="px-3 py-1 text-xs text-gray-400">移动到分组</div>
-          <button v-for="g in accountStore.groups" :key="g.id" @click="moveToGroup(contextMenu.id, g.id)"
-            :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
-            {{ g.name }}
+          <button @click="exportSingleAccount(contextMenu.id)" :class="['w-full px-3 py-1.5 text-left text-sm', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
+            导出此邮箱
           </button>
+          <div class="relative">
+            <button
+              @click="toggleMoveGroupMenu"
+              :class="['w-full px-3 py-1.5 text-left text-sm flex items-center justify-between', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
+              <span>移动到分组</span>
+              <ChevronRight :size="14" :class="showMoveGroupMenu ? 'rotate-90' : ''" />
+            </button>
+            <div
+              v-if="showMoveGroupMenu"
+              :style="{ transform: `translateY(${submenuOffsetY}px)` }"
+              :class="[
+                'submenu absolute py-1 min-w-[140px] border rounded shadow-lg max-h-[240px] overflow-y-auto',
+                contextMenu.flipX ? 'right-full mr-1' : 'left-full ml-1',
+                'top-0',
+                darkMode ? 'bg-gray-800 border-gray-700 text-gray-200' : 'bg-white'
+              ]">
+              <button
+                v-for="g in accountStore.groups"
+                :key="g.id"
+                @click="moveToGroup(contextMenu.id, g.id)"
+                :class="['w-full px-3 py-1.5 text-left text-sm whitespace-nowrap', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">
+                {{ g.name }}
+              </button>
+            </div>
+          </div>
         </template>
       </div>
     </div>
+    </Transition>
 
     <!-- 确认弹窗 -->
-    <div v-if="confirmModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div :class="['rounded-lg shadow-xl w-[300px] p-4', darkMode ? 'bg-gray-800 text-gray-200' : 'bg-white']">
-        <p class="text-sm mb-4">{{ confirmModal.message }}</p>
-        <div class="flex justify-end gap-2">
-          <button @click="confirmModal = null" :class="['px-3 py-1.5 text-sm rounded', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">取消</button>
-          <button @click="handleConfirm" class="px-3 py-1.5 text-sm bg-red-500 text-white rounded hover:bg-red-600">确定</button>
+    <Transition name="modal-fade">
+      <div v-if="confirmModal" class="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+        <div :class="['rounded-lg shadow-xl w-[300px] p-4', darkMode ? 'bg-gray-800 text-gray-200' : 'bg-white']">
+          <p class="text-sm mb-4">{{ confirmModal.message }}</p>
+          <div class="flex justify-end gap-2">
+            <button @click="confirmModal = null" :class="['px-3 py-1.5 text-sm rounded', darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-100']">取消</button>
+            <button @click="handleConfirm" class="px-3 py-1.5 text-sm bg-red-500 text-white rounded hover:bg-red-600">确定</button>
+          </div>
         </div>
       </div>
-    </div>
+    </Transition>
 
     <!-- Toast提示 -->
     <Transition name="toast">
@@ -974,16 +1123,93 @@ function downloadAttachment(att: any) {
 
 <style scoped>
 .toast-enter-active, .toast-leave-active {
-  transition: opacity 0.3s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease;
 }
 .toast-enter-from, .toast-leave-to {
   opacity: 0;
+  transform: translateY(6px) scale(0.98);
 }
-.hide-scrollbar {
+
+.modal-fade-enter-active, .modal-fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+.modal-fade-enter-from, .modal-fade-leave-to {
+  opacity: 0;
+}
+.modal-fade-enter-active > div,
+.modal-fade-leave-active > div {
+  transition: transform 0.2s ease, opacity 0.2s ease;
+}
+.modal-fade-enter-from > div,
+.modal-fade-leave-to > div {
+  transform: translateY(8px) scale(0.98);
+  opacity: 0;
+}
+
+.menu-pop-enter-active, .menu-pop-leave-active {
+  transition: opacity 0.16s ease, transform 0.16s ease;
+  transform-origin: top left;
+}
+.menu-pop-enter-from, .menu-pop-leave-to {
+  opacity: 0;
+  transform: translateY(4px) scale(0.98);
+}
+
+.hide-scrollbar,
+.overflow-auto,
+.overflow-y-auto,
+textarea,
+iframe {
   -ms-overflow-style: none;
   scrollbar-width: none;
 }
-.hide-scrollbar::-webkit-scrollbar {
+
+.hide-scrollbar::-webkit-scrollbar,
+.overflow-auto::-webkit-scrollbar,
+.overflow-y-auto::-webkit-scrollbar,
+textarea::-webkit-scrollbar,
+iframe::-webkit-scrollbar {
   display: none;
+  width: 0;
+  height: 0;
+}
+
+button,
+[role='button'] {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.1s ease, opacity 0.15s ease;
+}
+
+button:active,
+[role='button']:active {
+  transform: scale(0.98);
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.45);
+}
+
+.group > button {
+  transition: opacity 0.15s ease;
+}
+
+tr,
+tr td,
+.context-menu button,
+.submenu button {
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+/* Context menu submenu styles */
+.context-menu {
+  overflow: visible;
+}
+
+.submenu {
+  z-index: 60;
+  transition: transform 0.15s ease, opacity 0.15s ease;
 }
 </style>

@@ -50,6 +50,7 @@ wailsjs/
 
 # Claude/AI config (optional, remove if you want to keep)
 .claude/
+.worktrees/
 
 # Temporary files
 *.tmp

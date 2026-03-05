@@ -82,11 +82,11 @@ export const useAccountStore = defineStore('account', () => {
     console.log('[AccountStore] importAccounts 开始 - 内容长度:', content.length)
     try {
       // @ts-ignore
-      const count = await window.go.main.App.ImportAccounts(content)
-      console.log('[AccountStore] importAccounts 成功 - 导入数量:', count)
+      const result = await window.go.main.App.ImportAccounts(content)
+      console.log('[AccountStore] importAccounts 完成 - total:', result?.total, 'success:', result?.success, 'failed:', result?.failed)
       await loadAccounts()
       await loadGroups()
-      return count
+      return result?.success || 0
     } catch (e) {
       console.error('[AccountStore] importAccounts 失败:', e)
       throw e
