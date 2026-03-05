@@ -33,6 +33,29 @@
 
 ---
 
+## 界面截图
+
+<table>
+  <tr>
+    <td align="center">
+      <strong>邮件查看</strong><br />
+      <img src="screenshots/mail-view.png" alt="邮件查看界面" width="100%" />
+    </td>
+    <td align="center">
+      <strong>账号管理</strong><br />
+      <img src="screenshots/manage-view.png" alt="账号管理界面" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center" colspan="2">
+      <strong>深色模式</strong><br />
+      <img src="screenshots/dark-mode.png" alt="深色模式界面" width="70%" />
+    </td>
+  </tr>
+</table>
+
+---
+
 ## 技术栈
 
 - **Desktop**: Wails v2
@@ -145,22 +168,6 @@ wails build
 ```text
 邮箱<TAB>密码<TAB>ClientID<TAB>RefreshToken<TAB>分组名
 ```
-
----
-
-## 界面截图
-
-### 1) 邮件查看
-
-![邮件查看界面](screenshots/mail-view.png)
-
-### 2) 账号管理
-
-![账号管理界面](screenshots/manage-view.png)
-
-### 3) 深色模式
-
-![深色模式界面](screenshots/dark-mode.png)
 
 ---
 
